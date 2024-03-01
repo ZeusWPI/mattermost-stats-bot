@@ -1,14 +1,16 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"net/http"
 	"os"
 	"os/signal"
-	"regexp"
 	"time"
 
-	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/rs/zerolog"
 )
 
@@ -21,6 +23,7 @@ func main() {
 				TimeFormat: time.RFC822,
 			},
 		).With().Timestamp().Logger(),
+		//messagesCount: prometheus.NewCounter(),
 	}
 
 	app.config = loadConfig()
@@ -34,7 +37,9 @@ func main() {
 	// Login.
 	app.mattermostClient.SetToken(app.config.mattermostToken)
 
-	if user, resp, err := app.mattermostClient.GetUser("me", ""); err != nil {
+	ctx := context.Background()
+
+	if user, resp, err := app.mattermostClient.GetUser(ctx, "me", ""); err != nil {
 		app.logger.Fatal().Err(err).Msg("Could not log in")
 	} else {
 		app.logger.Debug().Interface("user", user).Interface("resp", resp).Msg("")
@@ -43,28 +48,63 @@ func main() {
 	}
 
 	// Find and save the bot's team to app struct.
-	if team, resp, err := app.mattermostClient.GetTeamByName(app.config.mattermostTeamName, ""); err != nil {
+	if team, resp, err := app.mattermostClient.GetTeamByName(ctx, app.config.mattermostTeamName, ""); err != nil {
 		app.logger.Fatal().Err(err).Msg("Could not find team. Is this bot a member ?")
 	} else {
 		app.logger.Debug().Interface("team", team).Interface("resp", resp).Msg("")
 		app.mattermostTeam = team
 	}
 
+	page := 0
+	joined_count := 0
+	for { // perPage my ass
+		if channels, _, err := app.mattermostClient.GetPublicChannelsForTeam(ctx, app.mattermostTeam.Id, page, 30, ""); err != nil {
+			app.logger.Fatal().Err(err).Msg("Could not list all channels, help ?")
+		} else {
+			if len(channels) == 0 {
+				break
+			} else {
+				for _, channel := range channels {
+					if _, _, err := app.mattermostClient.AddChannelMember(ctx, channel.Id, app.mattermostUser.Id); err != nil {
+						app.logger.Warn().Err(err).Interface("channel", channel).Msg("Failed to join channel, help ?")
+					} else {
+						joined_count++
+					}
+				}
+			}
+		}
+
+		page++
+	}
+
+	app.logger.Info().Interface("count", joined_count).Msg("Joined Channels")
+
 	// Find and save the talking channel to app struct.
 	if channel, resp, err := app.mattermostClient.GetChannelByName(
-		app.config.mattermostChannel, app.mattermostTeam.Id, "",
+		ctx, app.config.mattermostAdminChannel, app.mattermostTeam.Id, "",
 	); err != nil {
 		app.logger.Fatal().Err(err).Msg("Could not find channel. Is this bot added to that channel ?")
 	} else {
 		app.logger.Debug().Interface("channel", channel).Interface("resp", resp).Msg("")
-		app.mattermostChannel = channel
+		app.mattermostAdminChannel = channel
 	}
 
 	// Send a message (new post).
-	sendMsgToTalkingChannel(app, "Hi! I am a bot.", "")
+	sendMsgToTalkingChannel(app, "Hi! StatBot represent.", "")
+
+	// Run the prometheus exporter
+	go serveMetrics(app)
 
 	// Listen to live events coming in via websocket.
 	listenToEvents(app)
+}
+
+func serveMetrics(app *application) {
+	collector := newStatsCollector(app)
+	prometheus.MustRegister(collector)
+
+	http.Handle("/metrics", promhttp.Handler())
+	app.logger.Fatal().AnErr("", http.ListenAndServe(":8000", nil))
 }
 
 func setupGracefulShutdown(app *application) {
@@ -87,12 +127,14 @@ func sendMsgToTalkingChannel(app *application, msg string, replyToId string) {
 	// All replies in a thread should reply to root.
 
 	post := &model.Post{}
-	post.ChannelId = app.mattermostChannel.Id
+	post.ChannelId = app.mattermostAdminChannel.Id
 	post.Message = msg
 
 	post.RootId = replyToId
 
-	if _, _, err := app.mattermostClient.CreatePost(post); err != nil {
+	ctx := context.Background()
+
+	if _, _, err := app.mattermostClient.CreatePost(ctx, post); err != nil {
 		app.logger.Error().Err(err).Str("RootID", replyToId).Msg("Failed to create post")
 	}
 }
@@ -102,7 +144,7 @@ func listenToEvents(app *application) {
 	failCount := 0
 	for {
 		app.mattermostWebSocketClient, err = model.NewWebSocketClient4(
-			fmt.Sprintf("ws://%s", app.config.mattermostServer.Host+app.config.mattermostServer.Path),
+			fmt.Sprintf("wss://%s", app.config.mattermostServer.Host+app.config.mattermostServer.Path),
 			app.mattermostClient.AuthToken,
 		)
 		if err != nil {
@@ -125,45 +167,10 @@ func listenToEvents(app *application) {
 
 func handleWebSocketEvent(app *application, event *model.WebSocketEvent) {
 
-	// Ignore other channels.
-	if event.GetBroadcast().ChannelId != app.mattermostChannel.Id {
-		return
-	}
-
 	// Ignore other types of events.
 	if event.EventType() != model.WebsocketEventPosted {
 		return
 	}
 
-	// Since this event is a post, unmarshal it to (*model.Post)
-	post := &model.Post{}
-	err := json.Unmarshal([]byte(event.GetData()["post"].(string)), &post)
-	if err != nil {
-		app.logger.Error().Err(err).Msg("Could not cast event to *model.Post")
-	}
-
-	// Ignore messages sent by this bot itself.
-	if post.UserId == app.mattermostUser.Id {
-		return
-	}
-
-	// Handle however you want.
-	handlePost(app, post)
-}
-
-func handlePost(app *application, post *model.Post) {
-	app.logger.Debug().Str("message", post.Message).Msg("")
-	app.logger.Debug().Interface("post", post).Msg("")
-
-	if matched, _ := regexp.MatchString(`(?:^|\W)hello(?:$|\W)`, post.Message); matched {
-
-		// If post has a root ID then its part of thread, so reply there.
-		// If not, then post is independent, so reply to the post.
-		if post.RootId != "" {
-			sendMsgToTalkingChannel(app, "I replied in an existing thread.", post.RootId)
-		} else {
-			sendMsgToTalkingChannel(app, "I just replied to a new post, starting a chain.", post.Id)
-		}
-		return
-	}
+	app.messagesCount += 1
 }

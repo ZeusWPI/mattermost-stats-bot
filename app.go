@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost/server/public/model"
 	"github.com/rs/zerolog"
 )
 
@@ -12,6 +12,8 @@ type application struct {
 	mattermostClient          *model.Client4
 	mattermostWebSocketClient *model.WebSocketClient
 	mattermostUser            *model.User
-	mattermostChannel         *model.Channel
+	mattermostAdminChannel    *model.Channel
 	mattermostTeam            *model.Team
+
+	messagesCount uint64
 }
